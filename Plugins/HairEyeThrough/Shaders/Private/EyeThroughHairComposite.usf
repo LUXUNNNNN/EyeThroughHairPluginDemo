@@ -1,0 +1,95 @@
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+#include "/Engine/Private/SceneTexturesCommon.ush"
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+
+Texture2D EyeColorDepthTexture;
+SamplerState EyeColorSampler;
+SamplerState EyeDepthSampler;
+Texture2D HairDepthTexture;
+SamplerState HairDepthSampler;
+Texture2D FaceDepthTexture;
+SamplerState FaceDepthSampler;
+//Texture2D EyeDepthTexture;
+//SamplerState EyeDepthSampler;
+
+//用来算基于ViewRect范围的UV
+float2 ViewRectMin;
+float2 InvViewRectSize;
+
+float MinDepthGapCm;
+float MaxHairThicknessCm;
+float FrontDepthToleranceCm;
+float EdgeFeatherCm;
+float OverlayOpacity;
+float InvalidDepthCm;
+float FaceDepthToleranceCm;
+
+//ForTest
+float EyeHairLerp;
+
+float SafeSmoothStep(float Edge0, float Edge1, float X)
+{
+    return saturate((X - Edge0) / max(Edge1 - Edge0, 1e-5));
+}
+
+void MainPS(
+    noperspective float4 UVAndScreenPos : TEXCOORD0,
+    float4 SvPosition : SV_POSITION,
+    out float4 OutColor : SV_Target0)
+{
+    //一个是AddDrawScreenPass依据InputViewport算出的uv，依赖于SceneColor.Extent。但这样与ViewRect最终裁剪出的屏幕对不上，因此需要自己手算一个AuxUV，代表ViewRect框选的画面范围。
+    const float2 UV = UVAndScreenPos.xy;
+    const float2 AuxUV = (SvPosition.xy - ViewRectMin) * InvViewRectSize;
+    
+    const float4 SceneColor = SceneColorTexture.SampleLevel(SceneColorSampler, UV, 0);
+    
+    const float3 EyeColor = EyeColorDepthTexture.SampleLevel(EyeColorSampler, AuxUV, 0).rgb;
+    const float EyeDepthCm = EyeColorDepthTexture.SampleLevel(EyeDepthSampler, AuxUV, 0).a;
+    const float HairDepthCm = HairDepthTexture.SampleLevel(HairDepthSampler, AuxUV, 0).r;
+    const float FaceDepthCm = FaceDepthTexture.SampleLevel(FaceDepthSampler, AuxUV, 0).r;
+    
+    // Main scene depth is DeviceZ; convert it to linear view-space distance in UE units (cm).
+    const float MainDeviceZ = LookupDeviceZ(UV);
+    const float MainDepthCm = ConvertFromDeviceZ(MainDeviceZ);
+    
+    const float EyeValid = 1.0 - step(InvalidDepthCm * 0.5, EyeDepthCm);
+    const float HairValid = 1.0 - step(InvalidDepthCm * 0.5, HairDepthCm);
+
+    // Positive when hair is in front of the eye.
+    const float DepthGapCm = EyeDepthCm - HairDepthCm;
+    //归一化刘海和眼睛之间的距离，增大EdgeFeather可让眼睛变得更浅
+    const float BehindHair = SafeSmoothStep(MinDepthGapCm,MinDepthGapCm + EdgeFeatherCm,DepthGapCm);
+    //一个从眼睛向刘海逐渐增大的蒙版。刘海厚度范围内全是1，从刘海边缘向眼睛逐渐减为0。眼睛如果在刘海内，就用最大透明度
+    const float WithinThickness = 1.0 - SafeSmoothStep(MaxHairThicknessCm,MaxHairThicknessCm + EdgeFeatherCm,DepthGapCm);
+
+    // Critical safety test: the frontmost main-scene surface must be this isolated hair layer.    //一些容差，如果MainDepth小于HairDepth，说明头发前面有遮挡，不显示眼睛颜色
+    //保证画面最前面的必须是刘海，MainDepth一定要约等于HairDepth
+    const float FrontDepthErrorCm = abs(MainDepthCm - HairDepthCm);
+    const float HairIsMainFrontSurface = 1.0 - SafeSmoothStep(FrontDepthToleranceCm,FrontDepthToleranceCm + EdgeFeatherCm,FrontDepthErrorCm);
+
+    //FaceDepth小于等于EyeDepth时，说明Eye是被遮挡的，只有FaceDepth比EyeDepth大的时候才会显示眼睛颜色
+    const float IsEyeNotHiddenByFace = 1.0 - SafeSmoothStep(0, FaceDepthToleranceCm,EyeDepthCm - FaceDepthCm);
+    
+    //float Mask = EyeValid * HairValid * BehindHair * WithinThickness * HairIsMainFrontSurface;
+    float Mask = EyeValid * HairValid * BehindHair * WithinThickness * HairIsMainFrontSurface * IsEyeNotHiddenByFace;
+    Mask = saturate(Mask * OverlayOpacity);
+
+    // The pass runs before DOF / tonemap. BaseColor is linear 0..1, so pre-expose it
+    // before inserting it into HDR SceneColor.
+    //目前暂时不需要，因为目前的EyeRGB本身就是CRP的SceneColor，不是GBuffer中的BaseColor，无需额外乘一次PreExposure
+    const float3 PreExposedEyeColor = EyeColor * View.PreExposure;
+    
+    float Valid = FaceDepthCm < 65000.0f ? 1.0f : 0.0f;
+    float3 validDepthColor = float3(Valid, Valid, Valid);
+    float EyeMaskArea = EyeDepthCm < 65000.0f ? 1.0f : 0.0f;
+    //OutColor = float4(lerp((EyeDepthCm-FaceDepthcm)/10000.0,validDepthColor,EyeHairLerp), 1);
+    //OutColor = float4(lerp(float3(HairDepthCm,HairDepthCm,HairDepthCm)/100000,float3(FaceDepthCm,FaceDepthCm,FaceDepthCm)/100000,EyeHairLerp),1);
+    OutColor = float4(lerp(SceneColor.rgb, lerp(SceneColor.rgb, EyeColor, EyeMaskArea),  Mask * EyeHairLerp),1);
+    //float3 exposedArea = float3(IsEyeNotHiddenByFace,IsEyeNotHiddenByFace,IsEyeNotHiddenByFace);
+    //OutColor = float4(lerp(validDepthColor, exposedArea, EyeHairLerp ),1);
+    //OutColor = float4(BehindHair,BehindHair,BehindHair,1);
+    //OutColor = EyeColorDepthTexture.SampleLevel(EyeColorSampler,AuxUV,0);
+}

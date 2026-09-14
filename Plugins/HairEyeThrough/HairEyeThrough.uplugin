@@ -1,0 +1,18 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Hair Eye Through",
+  "Description": "UE 5.4 CRP + SceneViewExtension for anime eyes visible through front hair.",
+  "Category": "Rendering",
+  "CreatedBy": "Azur",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Modules": [
+    {
+      "Name": "HairEyeThrough",
+      "Type": "Runtime",
+      "LoadingPhase": "PostConfigInit"
+    }
+  ]
+}
